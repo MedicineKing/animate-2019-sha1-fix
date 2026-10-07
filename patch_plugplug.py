@@ -13,17 +13,21 @@ This script patches YOUR OWN copy of PlugPlugOwl.dll in place (backup first).
 No Adobe binaries are distributed here.
 
 Usage:
-    python patch_plugplug.py [path-to-PlugPlugOwl.dll]
-    default: C:\\Program Files\\Adobe\\Adobe Animate CC 2019\\PlugPlugOwl.dll
+    python patch_plugplug.py                 # 自动探测安装目录
+    python patch_plugplug.py <dll 路径>
+    python patch_plugplug.py <安装目录>
+    python patch_plugplug.py --force <路径>   # 强制修复未验证版本(风险自担)
+
+默认仅修改 md5 与已知 9.2.1.39 原版一致的文件; 其它版本只报告, 不做改动。
 """
 import hashlib
 import shutil
 import sys
 from pathlib import Path
 
-DEFAULT = r"C:\Program Files\Adobe\Adobe Animate CC 2019\PlugPlugOwl.dll"
+KNOWN_MD5 = "06a4680e91fa65a40f26253696255f40"  # 原版 9.2.1.39
 
-# 原始出口序列: pshufd x2 + movdqu/movd (digest 写出) + 4x movaps [rax-*] + mov rsp,rax
+# 原始出口序列: movdqu/movd (digest 写出) + 4x movaps [rax-*] + mov rsp,rax
 ANCHOR_OLD = bytes.fromhex(
     "f30f7f07660f7e4f10"                     # movdqu [rdi],xmm0 ; movd [rdi+10h],xmm1
     "0f2870b80f2878c8440f2840d8440f2848e8"   # movaps xmm6..9,[rax-48/-38/-28/-18h]
@@ -43,40 +47,134 @@ PATCH_NEW = bytes.fromhex(
 )
 
 
+def dll_version(data: bytes):
+    """从 PE 版本资源读 FileVersion (搜 VS_FIXEDFILEINFO 签名)。"""
+    sig = data.find(bytes.fromhex("bd04effe"))  # 0xFEEF04BD
+    if sig < 0 or sig + 16 > len(data):
+        return None
+    ms = int.from_bytes(data[sig + 8:sig + 12], "little")
+    ls = int.from_bytes(data[sig + 12:sig + 16], "little")
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+
+def candidate_dlls():
+    """自动探测: Adobe 注册表键 -> Uninstall 注册表 -> 常见路径。"""
+    cands = []
+
+    def add_dir(d):
+        if not d:
+            return
+        p = Path(str(d).strip().strip('"'))
+        if p.is_dir():
+            dll = p / "PlugPlugOwl.dll"
+            if dll.is_file() and dll not in cands:
+                cands.append(dll)
+
+    try:
+        import winreg
+
+        # 1) Adobe 专属键: HKLM\SOFTWARE\Adobe\Animate\<ver>\ApplicationPath
+        for base in (r"SOFTWARE\Adobe\Animate", r"SOFTWARE\WOW6432Node\Adobe\Animate"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+                    for i in range(winreg.QueryInfoKey(k)[0]):
+                        try:
+                            sub = winreg.EnumKey(k, i)
+                            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base + "\\" + sub) as sk:
+                                try:
+                                    add_dir(winreg.QueryValueEx(sk, "ApplicationPath")[0])
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+        # 2) Uninstall 键兜底
+        for base in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                     r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+                    for i in range(winreg.QueryInfoKey(k)[0]):
+                        try:
+                            sub = winreg.EnumKey(k, i)
+                            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base + "\\" + sub) as sk:
+                                try:
+                                    name = winreg.QueryValueEx(sk, "DisplayName")[0]
+                                except OSError:
+                                    continue
+                                if "animate" not in name.lower():
+                                    continue
+                                for v in ("InstallLocation", "DisplayIcon"):
+                                    try:
+                                        add_dir(winreg.QueryValueEx(sk, v)[0].split(",")[0])
+                                    except OSError:
+                                        pass
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except ImportError:
+        pass  # 非 Windows 环境仅走常见路径
+
+    # 3) 常见安装路径
+    for drive in "CDEFGH":
+        for sub in (r"Program Files\Adobe\Adobe Animate CC 2019",
+                    r"Program Files (x86)\Adobe\Adobe Animate CC 2019",
+                    r"Adobe\Adobe Animate CC 2019"):
+            add_dir(f"{drive}:\\{sub}")
+    return cands
+
+
 def main() -> int:
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(DEFAULT)
-    if not path.exists():
-        print("ERROR: file not found:", path)
-        return 1
+    force = "--force" in sys.argv
+    argv = [a for a in sys.argv[1:] if a != "--force"]
+    arg = argv[0] if argv else None
+    if arg:
+        p = Path(arg)
+        targets = [p if p.suffix.lower() == ".dll" else p / "PlugPlugOwl.dll"]
+    else:
+        targets = candidate_dlls()
+        if not targets:
+            print("未自动找到 Animate 的 PlugPlugOwl.dll。")
+            print('请手动指定: python patch_plugplug.py "D:\\Adobe\\Adobe Animate CC 2019"')
+            return 1
+        print(f"自动发现 {len(targets)} 个候选:\n")
 
-    data = path.read_bytes()
-    md5 = hashlib.md5(data).hexdigest()
+    fixed = 0
+    for dll in targets:
+        if not dll.is_file():
+            print(f"[跳过] 不存在: {dll}")
+            continue
+        data = dll.read_bytes()
+        ver = dll_version(data) or "未知"
+        new_anchor = ANCHOR_OLD[:9] + PATCH_NEW
+        if data.count(new_anchor) == 1:
+            state = "已修复"
+        elif data.count(ANCHOR_OLD) == 1:
+            state = "可修复"
+        else:
+            state = "未知/版本不匹配"
+        print(f"[{state}] {dll}")
+        print(f"           版本 {ver}  (md5 {hashlib.md5(data).hexdigest()})")
+        if state != "可修复":
+            continue
+        if hashlib.md5(data).hexdigest() != KNOWN_MD5 and not force:
+            print("           跳过: 非已验证版本(9.2.1.39)。确认要修复请加 --force")
+            continue
+        i = data.find(ANCHOR_OLD)
+        start = i + 9
+        out = bytearray(data)
+        out[start:start + len(PATCH_NEW)] = PATCH_NEW
+        backup = dll.with_name(dll.name + ".bak")
+        if not backup.exists():
+            shutil.copy(dll, backup)
+        dll.write_bytes(bytes(out))
+        print(f"           => 已修复 (offset 0x{start:x}, 37 字节; 备份 {backup.name})")
+        fixed += 1
 
-    new_anchor = ANCHOR_OLD[:9] + PATCH_NEW
-    if data.count(new_anchor) == 1:
-        print("Already patched. Nothing to do.")
-        return 0
-
-    n = data.count(ANCHOR_OLD)
-    if n != 1:
-        print(f"ERROR: anchor not found uniquely (matched {n} time(s)).")
-        print("This DLL may be a different version or already modified.")
-        print("Known good md5: 06a4680e91fa65a40f26253696255f40 (9.2.1.39)")
-        return 1
-
-    i = data.find(ANCHOR_OLD)
-    start = i + 9  # 指向 4x movaps 起点
-    out = bytearray(data)
-    out[start:start + len(PATCH_NEW)] = PATCH_NEW
-
-    backup = path.with_name(path.name + ".bak")
-    if not backup.exists():
-        shutil.copy(path, backup)
-    path.write_bytes(bytes(out))
-
-    print(f"OK. patched at file offset 0x{start:x} ({len(PATCH_NEW)} bytes)")
-    print(f"    md5 before: {md5}")
-    print(f"    backup:     {backup}")
+    print()
+    print(f"完成, 修复 {fixed} 处。" if fixed else "没有需要修复的目标。")
     return 0
 
 

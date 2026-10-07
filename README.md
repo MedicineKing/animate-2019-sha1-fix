@@ -53,15 +53,30 @@ xmm 槽位与序言保存严格对称，rsp 恢复后 rdi/rsi 照常从原位置
 ## 用法
 
 ```bash
-python patch_plugplug.py "C:\Program Files\Adobe\Adobe Animate CC 2019\PlugPlugOwl.dll"
+python patch_plugplug.py                     # 自动探测安装目录(注册表 + 常见路径)
+python patch_plugplug.py <DLL 或目录路径>     # 手动指定
 ```
 
-- 自动备份同目录 `PlugPlugOwl.dll.bak`
-- 用 46 字节唯一锚点定位，不硬编码偏移；锚点不匹配会拒绝执行
-- 幂等：已修补的 DLL 提示 “Already patched”
+输出会列出每个候选 DLL 的**版本号**与状态：
 
-已知适用版本：**9.2.1.39**（Animate 19.1.0.349，原版 md5 `06a4680e91fa65a40f26253696255f40`）。
-2018–2020 世代的其它 Adobe CC 产品若使用同款 PlugPlugOwl，可先跑脚本试（锚点匹配即可）。
+```
+自动发现 2 个候选:
+
+[已修复] C:\Program Files\Adobe\Adobe Animate CC 2019\PlugPlugOwl.dll
+           版本 9.2.1.39  (md5 06a4680e...)
+[可修复] D:\Adobe\Adobe Animate CC 2019\PlugPlugOwl.dll
+           版本 9.2.1.39  (md5 06a4680e...)
+           => 已修复 (offset 0x19163, 37 字节; 备份 PlugPlugOwl.dll.bak)
+```
+
+- **版本检测**：只有 md5 与已知 9.2.1.39 原版（`06a4680e91fa65a40f26253696255f40`）
+  一致的文件才会被自动修改；其它版本只报告、不动手
+- 自动备份同目录 `PlugPlugOwl.dll.bak`（已存在则不覆盖）
+- 46 字节唯一锚点定位，不硬编码偏移；不匹配直接拒绝
+- 幂等：已修补的 DLL 检测为「已修复」
+
+> 2018–2020 世代的其它 Adobe CC 产品可能打包了同款故障代码。若检测到锚点匹配但版本
+> 未经验证，可在**自行备份确认**的前提下用 `--force` 尝试（不同构建的栈约定可能不同，风险自担）。
 
 ## 免责
 
